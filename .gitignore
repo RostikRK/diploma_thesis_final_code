@@ -1,0 +1,8 @@
+.venv/
+.idea/
+images
+mongodb
+neo4j
+weaviate_data
+Gathering_System/data_extractor/text_extraction.py
+.git.backup

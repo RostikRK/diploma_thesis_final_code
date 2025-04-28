@@ -1,0 +1,80 @@
+version: '3.8'
+services:
+  neo4j:
+    image: neo4j:latest
+    ports:
+      - "0.0.0.0:7474:7474"
+      - "0.0.0.0:7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/password1234
+      - NEO4J_dbms_connector_bolt_listen__address=0.0.0.0:7687
+      - NEO4J_dbms_connector_bolt_advertised__address=46.219.230.241:7687
+#      - NEO4J_dbms_connector_bolt_advertised__address=212.162.20.186:7687
+      - NEO4J_dbms_default__listen__address=0.0.0.0
+    volumes:
+      - ./neo4j/data:/data
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "0.0.0.0:27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=password1234
+    command: mongod --bind_ip 0.0.0.0
+    volumes:
+      - ./mongodb/data:/data/db
+
+  mongo-express:
+    image: mongo-express:latest
+    ports:
+      - "0.0.0.0:8081:8081"
+    environment:
+      - ME_CONFIG_MONGODB_ADMINUSERNAME=admin
+      - ME_CONFIG_MONGODB_ADMINPASSWORD=password1234
+      - ME_CONFIG_MONGODB_SERVER=mongodb
+      - ME_CONFIG_BASICAUTH_USERNAME=admin
+      - ME_CONFIG_BASICAUTH_PASSWORD=password1234
+    depends_on:
+      - mongodb
+    restart: always
+
+  weaviate:
+    image: semitechnologies/weaviate:1.23.7
+    ports:
+      - "8080:8080"
+    restart: always
+    environment:
+      QUERY_DEFAULTS_LIMIT: 100
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'text2vec-transformers'
+      ENABLE_MODULES: 'text2vec-transformers'
+      TRANSFORMERS_INFERENCE_API: 'http://text2vec-transformers:8080'
+      AUTOSCHEMA_ENABLED: 'true'
+      CLUSTER_HOSTNAME: 'node1'
+      LIMIT_RESOURCES: 'true'
+      DISK_USE_WARNING_PERCENTAGE: "85"
+      DISK_USE_READONLY_PERCENTAGE: "99"
+      QUERY_MAXIMUM_RESULTS: 10000
+    volumes:
+      - ./weaviate_data:/var/lib/weaviate
+    depends_on:
+      - text2vec-transformers
+
+  text2vec-transformers:
+    image: semitechnologies/transformers-inference:sentence-transformers-multi-qa-MiniLM-L6-cos-v1
+    environment:
+      ENABLE_CUDA: '0'
+      NVIDIA_VISIBLE_DEVICES: 'all'
+      WORKERS_PER_MODEL: '2'
+      BATCHING_ENABLED: 'true'
+      BATCHING_DYNAMIC: 'true'
+    ports:
+      - "8001:8080"
+
+  image-storage-api:
+    build: ./Images_Server
+    ports:
+      - "8082:80"
+    volumes:
+      - ./images:/app/images

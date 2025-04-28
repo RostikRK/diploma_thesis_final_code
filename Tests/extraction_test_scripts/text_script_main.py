@@ -1,0 +1,412 @@
+import os
+import json
+import logging
+import time
+import re
+import glob
+import torch
+import pandas as pd
+import argparse
+
+from unsloth import FastLanguageModel
+from unsloth.chat_templates import get_chat_template
+from transformers import TextStreamer
+from sentence_transformers import SentenceTransformer
+
+from extraction_utils import (
+    Graph, load_product_data, detect_loop, load_expected_result, create_prompt_text,
+    parse_graph, validate_graph
+)
+
+from extraction_evaluation_utils import (
+    calculate_json_accuracy, calculate_attribute_metrics_with_embeddings, calculate_measurement_metrics,
+    calculate_measurement_metrics_with_combined_similarity, validate_json_structure
+)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("text_extraction_test.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+# Set up start
+# MODEL_NAME = "unsloth/Qwen2.5-32B-Instruct-bnb-4bit"
+MODEL_NAME = "unsloth/Qwen2.5-7B-Instruct-bnb-4bit"
+MAX_SEQ_LENGTH = 25000
+MAX_RESPONCE_LENGTH = 5100
+# Set up end
+
+
+def load_model():
+    """Load the language model"""
+    logger.info(f"Loading model {MODEL_NAME}")
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=MODEL_NAME,
+        max_seq_length=MAX_SEQ_LENGTH,
+        load_in_4bit=True
+    )
+
+    FastLanguageModel.for_inference(model)
+
+    tokenizer = get_chat_template(
+        tokenizer,
+        chat_template="qwen-2.5",
+    )
+
+    return model, tokenizer
+
+
+
+def generate_extraction(model, tokenizer, prompt, use_loop_prevention=True):
+    """Generate parameter extraction from the prompt"""
+    try:
+        if isinstance(prompt, list) and isinstance(prompt[0], dict) and "role" in prompt[0]:
+            # Direct conversation format
+            inputs = tokenizer.apply_chat_template(
+                prompt,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).to("cuda")
+        else:
+            # Regular prompt format
+            inputs = tokenizer.apply_chat_template(
+                prompt,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).to("cuda")
+
+        loop_detected = False
+
+        if use_loop_prevention:
+            output_ids = model.generate(
+                input_ids=inputs,
+                max_new_tokens=MAX_RESPONCE_LENGTH,
+                use_cache=True,
+                temperature=0.6,
+                min_p=0.1,
+                top_p=0.7,
+            )
+            prompt_length = inputs.shape[1]
+            generated_text = tokenizer.decode(output_ids[0][prompt_length:], skip_special_tokens=True).strip()
+
+            # Fallback: if a loop is detected
+            if detect_loop(generated_text):
+                loop_detected = True
+                logger.warning("Loop detected, trying with different parameters")
+                output_ids = model.generate(
+                    input_ids=inputs,
+                    max_new_tokens=MAX_RESPONCE_LENGTH,
+                    use_cache=True,
+                    temperature=0.25,
+                    min_p=0.1,
+                    top_p=0.85
+                )
+                generated_text = tokenizer.decode(output_ids[0][prompt_length:], skip_special_tokens=True).strip()
+                if detect_loop(generated_text):
+                    logger.warning("Loop detected again, returning empty graph")
+                    return "{}", True
+            return generated_text, loop_detected
+        else:
+            text_streamer = TextStreamer(tokenizer, skip_prompt=True)
+            output_ids = model.generate(
+                input_ids=inputs,
+                streamer=text_streamer,
+                max_new_tokens=MAX_RESPONCE_LENGTH,
+                use_cache=True,
+                temperature=0.4,
+                min_p=0.1,
+                top_p=0.6
+            )
+            prompt_length = inputs.shape[1]
+            generated_text = tokenizer.decode(output_ids[0][prompt_length:], skip_special_tokens=True)
+            return generated_text.strip(), loop_detected
+    except Exception as e:
+        logger.error(f"Error generating extraction: {e}")
+        return "{}", False
+
+
+
+def extract_graph_from_text(model, tokenizer, text, product_data, use_loop_prevention=True, max_feedback_attempts=2):
+    """
+    Extracts a graph from text using two prompts, validates the output,
+    and uses a feedback loop to correct errors if necessary.
+    """
+    all_raw_responses = []
+    any_loop_detected = False
+    # First prompt attempt
+    prompt_2 = create_prompt_text(product_data, text, prompt_num=2)
+    response_2, loop_detected_2 = generate_extraction(model, tokenizer, prompt_2, use_loop_prevention)
+    all_raw_responses.append(response_2)
+    any_loop_detected = any_loop_detected or loop_detected_2
+    graph_2 = parse_graph(response_2, logger)
+
+    # If graph_2 is non-empty and passes validation, return it
+    errors_2 = validate_graph(graph_2) if graph_2.nodes else ["Empty graph"]
+    if graph_2.nodes and not errors_2:
+        return graph_2, response_2, any_loop_detected
+
+    # Try second prompt
+    prompt_1 = create_prompt_text(product_data, text, prompt_num=1)
+    response_1, loop_detected_1 = generate_extraction(model, tokenizer, prompt_1, use_loop_prevention)
+    all_raw_responses.append(response_1)
+    any_loop_detected = any_loop_detected or loop_detected_1
+    graph_1 = parse_graph(response_1, logger)
+
+    # If graph_1 is non-empty and passes validation, return it
+    errors_1 = validate_graph(graph_1) if graph_1.nodes else ["Empty graph"]
+    if graph_1.nodes and not errors_1:
+        return graph_1, response_1, any_loop_detected
+
+    # If both graphs are empty, return empty graph
+    if not graph_2.nodes and not graph_1.nodes:
+        return Graph(nodes=[], relationships=[]), "\n\n---\n\n".join(all_raw_responses), any_loop_detected
+
+    # Choose the graph with fewer errors or the non-empty one
+    if graph_2.nodes and (not graph_1.nodes or len(errors_2) <= len(errors_1)):
+        graph = graph_2
+        errors = errors_2
+        conversation = [
+            {"role": "system", "content": prompt_2[0]["content"]},
+            {"role": "user", "content": prompt_2[1]["content"]},
+            {"role": "assistant", "content": response_2}
+        ]
+        current_response = response_2
+    else:
+        graph = graph_1
+        errors = errors_1
+        conversation = [
+            {"role": "system", "content": prompt_1[0]["content"]},
+            {"role": "user", "content": prompt_1[1]["content"]},
+            {"role": "assistant", "content": response_1}
+        ]
+        current_response = response_1
+
+    # Feedback loop to correct errors
+    for attempt in range(max_feedback_attempts):
+        if not errors:
+            return graph, current_response, any_loop_detected
+
+        # Provide feedback to the model
+        feedback = (
+                "There are some errors in the provided graph:\n" +
+                "\n".join(errors) +
+                "\nPlease correct these errors and provide the updated graph."
+        )
+
+        # Add feedback to conversation
+        conversation.append({"role": "user", "content": feedback})
+
+        # Generate corrected response
+        corrected_response, loop_detected = generate_extraction(model, tokenizer, conversation, use_loop_prevention)
+        all_raw_responses.append(corrected_response)
+        any_loop_detected = any_loop_detected or loop_detected
+        conversation.append({"role": "assistant", "content": corrected_response})
+        current_response = corrected_response
+
+        # Parse and validate the corrected graph
+        corrected_graph = parse_graph(corrected_response, logger)
+        errors = validate_graph(corrected_graph)
+
+        # Update the graph
+        if not errors or (corrected_graph.nodes and len(errors) < len(validate_graph(graph))):
+            graph = corrected_graph
+
+    # After max attempts, return the best graph we have
+    return graph, "\n\n---\n\n".join(all_raw_responses), any_loop_detected
+
+
+def run_tests(test_dir: str, output_dir: str):
+    """Run tests on all test files in the directory"""
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Find all product data files
+    product_files = glob.glob(os.path.join(test_dir, "product_data_*.txt"))
+    product_files.sort()
+
+    model, tokenizer = load_model()
+    print("Loading sentence transformer model...")
+    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    embedding_model.to(device)
+    print(f"Model loaded and moved to {device}")
+
+    results = []
+    total_start_time = time.time()
+
+    for i, product_file in enumerate(product_files):
+        try:
+            test_num = re.search(r"product_data_(\d+)\.txt", product_file).group(1)
+            expected_file = os.path.join(test_dir, f"result_{test_num}.json")
+            markdown_file = os.path.join(test_dir, f"mistral_markdown_{test_num}.md")
+
+            if not os.path.exists(expected_file):
+                logger.warning(f"Expected result file not found: {expected_file}")
+                continue
+
+            if not os.path.exists(markdown_file):
+                logger.warning(f"Markdown file not found: {markdown_file}")
+                continue
+
+            logger.info(f"Processing test case {test_num} ({i + 1}/{len(product_files)})")
+
+            # Load product data and expected result
+            product_data = load_product_data(product_file)
+            expected_result = load_expected_result(expected_file)
+
+            if not product_data or not expected_result:
+                logger.warning(f"Skipping test case {test_num} due to missing data")
+                continue
+
+            # Read markdown text from file instead of processing image
+            start_time = time.time()
+            try:
+                with open(markdown_file, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                logger.info(f"Loaded markdown text from {markdown_file}")
+            except Exception as e:
+                logger.error(f"Failed to read markdown file: {e}")
+                continue
+
+            # Extract parameters from text
+            extracted_graph, raw_responses, loops_detected = extract_graph_from_text(model, tokenizer, text, product_data)
+            extracted_json = extracted_graph.model_dump() if extracted_graph else {}
+
+            # Calculate metrics
+            json_accuracy = calculate_json_accuracy(extracted_json, expected_result)
+            attr_metrics = calculate_attribute_metrics_with_embeddings(extracted_json, expected_result, embedding_model)
+            meas_metrics = calculate_measurement_metrics(extracted_json, expected_result)
+            meas_attr_sim_metrics = calculate_measurement_metrics_with_combined_similarity(extracted_json, expected_result, embedding_model)
+
+            # Calculate new structure validation metrics
+            struct_metrics = validate_json_structure(extracted_json, expected_result)
+
+            processing_time = time.time() - start_time
+
+            # Save individual result
+            individual_result = {
+                "test_case": test_num,
+                "product_name": product_data['product_name'],
+                "extracted_json": extracted_json,
+                "expected_json": expected_result,
+                "raw_responses": raw_responses,
+                "loops_detected": loops_detected,
+                "json_accuracy": json_accuracy,
+                "attr_accuracy": attr_metrics["accuracy"],
+                "attr_precision": attr_metrics["precision"],
+                "attr_recall": attr_metrics["recall"],
+                "attr_f1": attr_metrics["f1"],
+                "attr_combined": attr_metrics["combined_similarity"],
+                "meas_accuracy": meas_metrics["accuracy"],
+                "meas_precision": meas_metrics["precision"],
+                "meas_recall": meas_metrics["recall"],
+                "meas_f1": meas_metrics["f1"],
+                "meas_jaro_winkler": meas_metrics["jaro_winkler"],
+                "meas_attr_sim_accuracy": meas_attr_sim_metrics["accuracy"],
+                "meas_attr_sim_precision": meas_attr_sim_metrics["precision"],
+                "meas_attr_sim_recall": meas_attr_sim_metrics["recall"],
+                "meas_attr_sim_f1": meas_attr_sim_metrics["f1"],
+                "structure_score": struct_metrics["structure_score"],
+                "empty_state_match": struct_metrics["empty_state_match"],
+                "has_attribute_nodes": struct_metrics["has_attribute_nodes"],
+                "has_measurement_nodes": struct_metrics["has_measurement_nodes"],
+                "has_relationships": struct_metrics["has_relationships"],
+                "false_positive_empty": struct_metrics["false_positive_empty"],
+                "false_negative_empty": struct_metrics["false_negative_empty"],
+                # Processing time
+                "processing_time": processing_time
+            }
+
+            # Save to results list (aggregation data)
+            results.append({
+                "test_case": test_num,
+                "product_name": product_data['product_name'],
+                "json_accuracy": json_accuracy,
+                "loops_detected": loops_detected,
+                "attr_accuracy": attr_metrics["accuracy"],
+                "attr_precision": attr_metrics["precision"],
+                "attr_recall": attr_metrics["recall"],
+                "attr_f1": attr_metrics["f1"],
+                "attr_combined": attr_metrics["combined_similarity"],
+                "meas_accuracy": meas_metrics["accuracy"],
+                "meas_precision": meas_metrics["precision"],
+                "meas_recall": meas_metrics["recall"],
+                "meas_f1": meas_metrics["f1"],
+                "meas_jaro_winkler": meas_metrics["jaro_winkler"],
+                "meas_attr_sim_accuracy": meas_attr_sim_metrics["accuracy"],
+                "meas_attr_sim_precision": meas_attr_sim_metrics["precision"],
+                "meas_attr_sim_recall": meas_attr_sim_metrics["recall"],
+                "meas_attr_sim_f1": meas_attr_sim_metrics["f1"],
+                "structure_score": struct_metrics["structure_score"],
+                "processing_time": processing_time
+            })
+
+            with open(os.path.join(output_dir, f"test_result_{test_num}.json"), 'w') as f:
+                json.dump(individual_result, f, indent=2)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        except Exception as e:
+            logger.error(f"Error processing test case {product_file}: {e}")
+
+    total_time = time.time() - total_start_time
+
+    results_df = pd.DataFrame(results)
+
+    # Calculate overall metrics
+    overall_metrics = {
+        "total_tests": len(results),
+        "total_time": total_time,
+        "avg_processing_time": results_df['processing_time'].mean() if len(results) > 0 else 0,
+        "json_accuracy_avg": results_df['json_accuracy'].mean() if len(results) > 0 else 0,
+        "loops_detected_count": sum(1 for r in results if r.get('loops_detected', False)),
+        "attr_accuracy_avg": results_df['attr_accuracy'].mean() if len(results) > 0 else 0,
+        "attr_precision_avg": results_df['attr_precision'].mean() if len(results) > 0 else 0,
+        "attr_recall_avg": results_df['attr_recall'].mean() if len(results) > 0 else 0,
+        "attr_f1_avg": results_df['attr_f1'].mean() if len(results) > 0 else 0,
+        "attr_combined_avg": results_df['attr_combined'].mean() if len(results) > 0 else 0,
+        "meas_accuracy_avg": results_df['meas_accuracy'].mean() if len(results) > 0 else 0,
+        "meas_precision_avg": results_df['meas_precision'].mean() if len(results) > 0 else 0,
+        "meas_recall_avg": results_df['meas_recall'].mean() if len(results) > 0 else 0,
+        "meas_f1_avg": results_df['meas_f1'].mean() if len(results) > 0 else 0,
+        "meas_jaro_winkler_avg": results_df['meas_jaro_winkler'].mean() if len(results) > 0 else 0,
+        "meas_attr_sim_accuracy_avg": results_df['meas_attr_sim_accuracy'].mean() if len(results) > 0 else 0,
+        "meas_attr_sim_precision_avg": results_df['meas_attr_sim_precision'].mean() if len(results) > 0 else 0,
+        "meas_attr_sim_recall_avg": results_df['meas_attr_sim_recall'].mean() if len(results) > 0 else 0,
+        "meas_attr_sim_f1_avg": results_df['meas_attr_sim_f1'].mean() if len(results) > 0 else 0,
+        "structure_score_avg": results_df['structure_score'].mean() if len(results) > 0 else 0
+    }
+
+    with open(os.path.join(output_dir, 'overall_metrics.json'), 'w') as f:
+        json.dump(overall_metrics, f, indent=2)
+
+    results_df.to_csv(os.path.join(output_dir, 'detailed_results.csv'), index=False)
+
+    logger.info(f"Testing completed. Processed {len(results)} test cases in {total_time:.2f} seconds")
+    logger.info(f"Overall JSON accuracy: {overall_metrics['json_accuracy_avg']:.4f}")
+    logger.info(f"Overall attribute F1 score: {overall_metrics['attr_f1_avg']:.4f}")
+    logger.info(f"Overall attribute Jaro-Winkler: {overall_metrics['attr_combined_avg']:.4f}")
+    logger.info(f"Overall measurement F1 score: {overall_metrics['meas_f1_avg']:.4f}")
+    logger.info(f"Overall measurement Jaro-Winkler: {overall_metrics['meas_jaro_winkler_avg']:.4f}")
+    logger.info(f"Overall structure score: {overall_metrics['structure_score_avg']:.4f}")
+
+    return overall_metrics
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Run text-based parameter extraction tests')
+    parser.add_argument('--test_dir', type=str, required=True, help='Directory containing test files')
+    parser.add_argument('--output_dir', type=str, default='text_test_results', help='Directory to save test results')
+
+    args = parser.parse_args()
+
+    run_tests(args.test_dir, args.output_dir)
